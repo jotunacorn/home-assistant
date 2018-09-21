@@ -8,7 +8,7 @@ import logging
 
 import voluptuous as vol
 
-from homeassistant.const import (CONF_API_KEY, CONF_MONITORED_CONDITIONS)
+from homeassistant.const import (CONF_API_KEY, CONF_MONITORED_CONDITIONS, CONF_TIMEOUT)
 from homeassistant.components.sensor import PLATFORM_SCHEMA
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import Entity
@@ -32,6 +32,7 @@ SENSOR_TYPES = {
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_API_KEY): cv.string,
+    vol.Optional(CONF_TIMEOUT, default=86400): cv.positive_int,
     vol.Optional(CONF_MONITORED_CONDITIONS, default=['title', 'body']):
         vol.All(cv.ensure_list, vol.Length(min=1), [vol.In(SENSOR_TYPES)]),
 })
@@ -47,7 +48,7 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         _LOGGER.error("Wrong API key for Pushbullet supplied")
         return False
 
-    pbprovider = PushBulletNotificationProvider(pushbullet)
+    pbprovider = PushBulletNotificationProvider(pushbullet, hass, config.get(CONF_TIMEOUT))
 
     devices = []
     for sensor_type in config[CONF_MONITORED_CONDITIONS]:
@@ -93,13 +94,17 @@ class PushBulletNotificationSensor(Entity):
         return self._state_attributes
 
 
-class PushBulletNotificationProvider():
+class PushBulletNotificationProvider:
+    from homeassistant.core import callback
+
     """Provider for an account, leading to one or more sensors."""
 
-    def __init__(self, pb):
+    def __init__(self, pb, hass, timeout):
         """Start to retrieve pushes from the given Pushbullet instance."""
         import threading
         self.pushbullet = pb
+        self.hass = hass
+        self.timeout = timeout
         self._data = None
         self.listener = None
         self.thread = threading.Thread(target=self.retrieve_pushes)
@@ -120,15 +125,21 @@ class PushBulletNotificationProvider():
         """Return the current data stored in the provider."""
         return self._data
 
+    @callback
+    def reconnect(self):
+        """Reconnect the service so the connection does not get stale"""
+        self.listener.close()
+        self.listener.run()
+
     def retrieve_pushes(self):
         """Retrieve_pushes.
 
         Spawn a new Listener and links it to self.on_push.
+        Also queues a reconnection after the configured timeout if the timeout is greater than 0
         """
         from pushbullet import Listener
         self.listener = Listener(account=self.pushbullet, on_push=self.on_push)
+        if self.timeout > 0:
+            self.hass.loop.call_later(self.timeout, self.reconnect, self)
         _LOGGER.debug("Getting pushes")
-        try:
-            self.listener.run_forever()
-        finally:
-            self.listener.close()
+        self.listener.run()
